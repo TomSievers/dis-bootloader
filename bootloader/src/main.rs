@@ -13,6 +13,7 @@ use embassy_nrf::{
     uarte::{self, Uarte},
 };
 use panic_persist::get_panic_message_bytes;
+use rtt_target::{rprintln, rtt_init_print};
 use shared::{
     flash_addresses::{
         bootloader_flash_page_range, bootloader_flash_range, bootloader_scratch_page_range,
@@ -39,18 +40,28 @@ async fn main(_spawner: embassy_executor::Spawner) {
     run_main(device_peripherals, core_peripherals).await;
 }
 
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "uart-log")]
+        uprintln!($($arg)*);
+        #[cfg(not(feature = "uart-log"))]
+        rprintln!($($arg)*);
+    };
+}
+
 /// A print macro that takes the uart and then the print expression like println!.
 #[macro_export]
 macro_rules! uprintln {
-    ($uart:expr, $($arg:tt)*) => {
+    ($($arg:tt)*) => {
         {
             use core::fmt::Write as _;
             let mut str = arrayvec::ArrayString::<1024>::new();
             match writeln!(str, $($arg)*) {
                 Ok(_) => {
-                    $uart.write(str.as_bytes()).await.unwrap();
+                    UART.as_mut().unwrap().write(str.as_bytes()).await.unwrap();
                 },
-                Err(_) => $uart.write("Error: failed to print string, too long".as_bytes()).await.unwrap(),
+                Err(_) => UART.as_mut().unwrap().write("Error: failed to print string, too long".as_bytes()).await.unwrap(),
             };
         }
     };
@@ -65,35 +76,41 @@ async fn run_main(
         registers: unsafe { &*embassy_nrf::pac::NVMC::PTR },
     };
 
+    #[cfg(feature = "uart-log")]
+    {
+        let mut config = uarte::Config::default();
+        config.parity = uarte::Parity::EXCLUDED;
+        config.baudrate = uarte::Baudrate::BAUD115200;
+
+        let irq = interrupt::take!(UARTE0_SPIM0_SPIS0_TWIM0_TWIS0);
+
+        #[cfg(feature = "feather")]
+        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_05, device_peripherals.P0_06);
+        #[cfg(feature = "logistics")]
+        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_28, device_peripherals.P0_29);
+        #[cfg(feature = "mobility")]
+        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_28, device_peripherals.P0_29);
+        #[cfg(feature = "turing")]
+        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_30, device_peripherals.P0_19);
+        #[cfg(feature = "actinius_icarus")]
+        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_06, device_peripherals.P0_09);
+
+        UART = Some(uarte::Uarte::new(
+            device_peripherals.UARTETWISPI0,
+            irq,
+            uart_rx_pin,
+            uart_tx_pin,
+            config,
+        ));
+    }
+
+    #[cfg(not(feature = "uart-log"))]
+    rtt_init_print!();
+
     // Configure the uart
-    let mut config = uarte::Config::default();
-    config.parity = uarte::Parity::EXCLUDED;
-    config.baudrate = uarte::Baudrate::BAUD115200;
-
-    let irq = interrupt::take!(UARTE0_SPIM0_SPIS0_TWIM0_TWIS0);
-
-    #[cfg(feature = "feather")]
-    let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_05, device_peripherals.P0_06);
-    #[cfg(feature = "logistics")]
-    let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_28, device_peripherals.P0_29);
-    #[cfg(feature = "mobility")]
-    let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_28, device_peripherals.P0_29);
-    #[cfg(feature = "turing")]
-    let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_30, device_peripherals.P0_19);
-    #[cfg(feature = "actinius_icarus")]
-    let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_06, device_peripherals.P0_09);
-
-    let mut uart: Uart = uarte::Uarte::new(
-        device_peripherals.UARTETWISPI0,
-        irq,
-        uart_rx_pin,
-        uart_tx_pin,
-        config,
-    );
 
     // Show a sign of life and print the version
-    uprintln!(
-        uart,
+    println!(
         "\n\n--== == == == == == == == == == == == == == ==--\nStarting bootloader version `{}` with git hash `{}`",
         env!("CP_CARGO"),
         env!("CP_GIT")
@@ -108,50 +125,45 @@ async fn run_main(
 
     // Check if there was a panic message, if so, send to UART
     if let Some(msg) = get_panic_message_bytes() {
-        uprintln!(uart, "Booted up from a panic:");
-        uart.write(msg).await.unwrap();
+        println!("Booted up from a panic:");
+        let msg = unsafe { core::str::from_utf8_unchecked(msg) };
+        println!("{}", msg);
         *panics += 1;
-        uprintln!(uart, "");
     }
 
-    uprintln!(uart, "There have been {} panics so far.", panics);
+    println!("There have been {} panics so far.", panics);
 
     // If there are too many panics, let's just sleep and potentially save the flash memory
     if *panics > 10 {
-        uprintln!(uart, "There have been too many panics. Bootloader will try to save the flash by going to sleep. The device can be woken up by sending a single byte over serial. The panics counter will then be reset to 0 so you can see all the output again");
-        let mut buffer = [0; 1];
-        uart.read(&mut buffer).await.unwrap();
+        println!( "There have been too many panics. Bootloader will try to save the flash by going to sleep. The device can be woken up by sending a single byte over serial. The panics counter will then be reset to 0 so you can see all the output again");
         *panics = 0;
+        cortex_m::asm::wfi();
+        cortex_m::peripheral::SCB::sys_reset();
     }
 
     // Print the memory regions we're using, just for convenience
-    uprintln!(uart, "\nDefined memory regions:");
-    uprintln!(
-        uart,
+    println!("\nDefined memory regions:");
+    println!(
         "\tbootloader flash:   {:08X?} ({:03?})",
         bootloader_flash_range(),
         bootloader_flash_page_range()
     );
-    uprintln!(
-        uart,
+    println!(
         "\tbootloader scratch: {:08X?} ({:03?})",
         bootloader_scratch_range(),
         bootloader_scratch_page_range()
     );
-    uprintln!(
-        uart,
+    println!(
         "\tbootloader state:   {:08X?} ({:03?})",
         bootloader_state_range(),
         bootloader_state_page_range()
     );
-    uprintln!(
-        uart,
+    println!(
         "\tprogram slot a:     {:08X?} ({:03?})",
         program_slot_a_range(),
         program_slot_a_page_range()
     );
-    uprintln!(
-        uart,
+    println!(
         "\tprogram slot b:     {:08X?} ({:03?})",
         program_slot_b_range(),
         program_slot_b_page_range()
@@ -164,34 +176,34 @@ async fn run_main(
 
     // The state must be valid or we will just jump to the application
     if !state.is_valid() {
-        uprintln!(uart, "State is invalid, jumping to application");
-        jump_to_application(uart, scb).await;
+        println!("State is invalid, jumping to application");
+        jump_to_application(scb).await;
     }
 
     let goal = state.goal();
-    uprintln!(uart, "Goal: {:?}", goal);
+    println!("Goal: {:?}", goal);
 
     match goal {
         BootloaderGoal::JumpToApplication => {
-            jump_to_application(uart, scb).await;
+            jump_to_application(scb).await;
         }
         BootloaderGoal::StartSwap => {
             state.prepare_swap(false, &mut flash); // TODO: think about reset here
-            perform_swap(false, &mut state, &mut flash, &mut uart).await;
-            jump_to_application(uart, scb).await;
+            perform_swap(false, &mut state, &mut flash).await;
+            jump_to_application(scb).await;
         }
         BootloaderGoal::FinishSwap => {
-            perform_swap(false, &mut state, &mut flash, &mut uart).await;
-            jump_to_application(uart, scb).await;
+            perform_swap(false, &mut state, &mut flash).await;
+            jump_to_application(scb).await;
         }
         BootloaderGoal::StartTestSwap => {
             state.prepare_swap(true, &mut flash);
-            perform_swap(true, &mut state, &mut flash, &mut uart).await;
-            jump_to_application(uart, scb).await;
+            perform_swap(true, &mut state, &mut flash).await;
+            jump_to_application(scb).await;
         }
         BootloaderGoal::FinishTestSwap => {
-            perform_swap(true, &mut state, &mut flash, &mut uart).await;
-            jump_to_application(uart, scb).await;
+            perform_swap(true, &mut state, &mut flash).await;
+            jump_to_application(scb).await;
         }
     }
 
@@ -206,14 +218,13 @@ async fn perform_swap(
     test_swap: bool,
     state: &mut BootloaderState,
     flash: &mut impl shared::Flash,
-    uart: &mut Uart,
 ) {
     // Gather info about our memory layout
     let total_program_pages = program_slot_a_page_range().len() as u32;
     let total_scratch_pages = bootloader_scratch_page_range().len() as u32;
 
-    uprintln!(uart, "total_program_pages: {}", total_program_pages);
-    uprintln!(uart, "total_scratch_pages: {}", total_scratch_pages);
+    println!("total_program_pages: {}", total_program_pages);
+    println!("total_scratch_pages: {}", total_scratch_pages);
 
     // We're doing a round-robin for scratch page usage, so we need to keep track of the used index
     let mut scratch_page_index = 0;
@@ -229,12 +240,7 @@ async fn perform_swap(
         // We run a small statemachine that needs to continue until the page is swapped.
         // If we resume a swap due to a reset, then it is possible that a lot of pages have already been swapped
         while !state.get_page_state(page).is_swapped() {
-            uprintln!(
-                uart,
-                "Swapping page {}: {:?}",
-                page,
-                state.get_page_state(page)
-            );
+            println!("Swapping page {}: {:?}", page, state.get_page_state(page));
             // Depending on the state, we need to swap certain pages
             match state.get_page_state(page) {
                 PageState::Original => {
@@ -244,11 +250,9 @@ async fn perform_swap(
                     let scratch_page = bootloader_scratch_page_range().start + scratch_page_index;
                     let scratch_address = scratch_page * PAGE_SIZE;
 
-                    uprintln!(
-                        uart,
+                    println!(
                         "Moving page @{:#010X} to page {:#010X}",
-                        slot_a_address,
-                        scratch_address
+                        slot_a_address, scratch_address
                     );
 
                     // Erase the scratch area
@@ -267,11 +271,9 @@ async fn perform_swap(
                 PageState::InScratch { scratch_page } => {
                     // We need to copy the B page to the A slot
 
-                    uprintln!(
-                        uart,
+                    println!(
                         "Moving page @{:#010X} to page {:#010X}",
-                        slot_b_address,
-                        slot_a_address
+                        slot_b_address, slot_a_address
                     );
 
                     // Erase the A page
@@ -292,11 +294,9 @@ async fn perform_swap(
 
                     let scratch_address = scratch_page * PAGE_SIZE;
 
-                    uprintln!(
-                        uart,
+                    println!(
                         "Moving page @{:#010X} to page {:#010X}",
-                        scratch_address,
-                        slot_b_address
+                        scratch_address, slot_b_address
                     );
 
                     // Erase the B page
@@ -336,7 +336,7 @@ async fn perform_swap(
 }
 
 /// Jump to the application if the application vector table can be found
-async fn jump_to_application(mut uart: Uart, scb: SCB) -> ! {
+async fn jump_to_application(scb: SCB) -> ! {
     // The application may not be stationed at the start of its slot.
     // We need to search for it first.
     // We will bootload to the first non-erased & non-padding (0xFFFF_FFFF, 0x0000_0000) word if the word after it could be a pointer to a reset vector inside the program_slot_a_range.
@@ -370,10 +370,14 @@ async fn jump_to_application(mut uart: Uart, scb: SCB) -> ! {
 
     match application_address {
         Some(application_address) => {
-            uprintln!(uart, "Jumping to {:#08X}", application_address);
+            println!("Jumping to {:#08X}", application_address);
 
-            // We need to disable all used peripherals
-            drop(uart);
+            #[cfg(feautre = "uart-log")]
+            {
+                // We need to disable all used peripherals
+                drop(UART.take().unwrap());
+            }
+
             unsafe {
                 scb.vtor.write(application_address);
                 cortex_m::asm::bootload(application_address as *const u32)

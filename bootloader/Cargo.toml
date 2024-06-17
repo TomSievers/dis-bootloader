@@ -6,23 +6,31 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cortex-m = { version = "0.7.3", features = ["critical-section-single-core"]}
+cortex-m = { version = "0.7.3", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.3"
 nrf9160-pac = "0.10.1"
 
 panic-persist = "0.3.0"
 
-embassy-executor = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy.git", features = ["nightly"] }
-embassy-nrf = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy.git", features = ["nrf9160-s", "unstable-pac"] }
+embassy-executor = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy.git", features = [
+    "nightly",
+] }
+embassy-nrf = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy.git", features = [
+    "nrf9160-s",
+    "unstable-pac",
+] }
 
 shared = { path = "../shared" }
 arrayvec = { version = "0.7.2", default-features = false }
+rtt-target = { version = "0.4.0" }
 
 [features]
-default = ["feather"]
+default = []
 
-logistics = []
-mobility = []
-feather = []
-turing = []
-actinius_icarus = []
+uart-log = []
+
+logistics = ["uart-log"]
+mobility = ["uart-log"]
+feather = ["uart-log"]
+turing = ["uart-log"]
+actinius_icarus = ["uart-log"]
