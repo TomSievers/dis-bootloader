@@ -6,13 +6,17 @@
 
 use crate::flash::Flash;
 use core::mem::MaybeUninit;
-use cortex_m::peripheral::SCB;
+use cortex_m::peripheral::{sau::Ctrl, SAU};
+
+use embassy_nrf::pac::SPU;
+#[cfg(feature = "uart-log")]
 use embassy_nrf::{
     interrupt,
     peripherals::UARTETWISPI0,
     uarte::{self, Uarte},
 };
 use panic_persist::get_panic_message_bytes;
+#[cfg(not(feature = "uart-log"))]
 use rtt_target::{rprintln, rtt_init_print};
 use shared::{
     flash_addresses::{
@@ -26,6 +30,7 @@ use shared::{
 
 mod flash;
 
+#[cfg(feature = "uart-log")]
 type Uart = Uarte<'static, UARTETWISPI0>;
 
 /// A counter that keeps track of how many panics there have been. It keeps its value across resets.
@@ -40,6 +45,7 @@ async fn main(_spawner: embassy_executor::Spawner) {
     run_main(device_peripherals, core_peripherals).await;
 }
 
+/// A print macro that takes either UART or RTT to print
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {
@@ -172,12 +178,12 @@ async fn run_main(
     // Let's check what we need to do by loading the state
     let mut state = BootloaderState::load(&flash);
 
-    let scb = core_peripherals.SCB;
+    let sau = core_peripherals.SAU;
 
     // The state must be valid or we will just jump to the application
     if !state.is_valid() {
         println!("State is invalid, jumping to application");
-        jump_to_application(scb).await;
+        jump_to_application(sau).await;
     }
 
     let goal = state.goal();
@@ -185,25 +191,25 @@ async fn run_main(
 
     match goal {
         BootloaderGoal::JumpToApplication => {
-            jump_to_application(scb).await;
+            jump_to_application(sau).await;
         }
         BootloaderGoal::StartSwap => {
             state.prepare_swap(false, &mut flash); // TODO: think about reset here
             perform_swap(false, &mut state, &mut flash).await;
-            jump_to_application(scb).await;
+            jump_to_application(sau).await;
         }
         BootloaderGoal::FinishSwap => {
             perform_swap(false, &mut state, &mut flash).await;
-            jump_to_application(scb).await;
+            jump_to_application(sau).await;
         }
         BootloaderGoal::StartTestSwap => {
             state.prepare_swap(true, &mut flash);
             perform_swap(true, &mut state, &mut flash).await;
-            jump_to_application(scb).await;
+            jump_to_application(sau).await;
         }
         BootloaderGoal::FinishTestSwap => {
             perform_swap(true, &mut state, &mut flash).await;
-            jump_to_application(scb).await;
+            jump_to_application(sau).await;
         }
     }
 
@@ -336,7 +342,7 @@ async fn perform_swap(
 }
 
 /// Jump to the application if the application vector table can be found
-async fn jump_to_application(scb: SCB) -> ! {
+async fn jump_to_application(sau: SAU) -> ! {
     // The application may not be stationed at the start of its slot.
     // We need to search for it first.
     // We will bootload to the first non-erased & non-padding (0xFFFF_FFFF, 0x0000_0000) word if the word after it could be a pointer to a reset vector inside the program_slot_a_range.
@@ -379,12 +385,101 @@ async fn jump_to_application(scb: SCB) -> ! {
             }
 
             unsafe {
-                scb.vtor.write(application_address);
-                cortex_m::asm::bootload(application_address as *const u32)
+                let spu = core::mem::transmute::<_, SPU>(());
+
+                // Leave the first 64KiB as secure and make everything else non secure
+                for region in spu.flashregion.iter().skip(2) {
+                    region.perm.write(|w| {
+                        w.secattr()
+                            .non_secure()
+                            .read()
+                            .enable()
+                            .write()
+                            .enable()
+                            .execute()
+                            .enable()
+                    });
+                }
+
+                // Leave the first 64KiB as secure and make everything else non secure
+                for region in spu.ramregion.iter().skip(8) {
+                    region.perm.write(|w| {
+                        w.secattr()
+                            .non_secure()
+                            .execute()
+                            .enable()
+                            .read()
+                            .enable()
+                            .write()
+                            .enable()
+                    });
+                }
+
+                // Make all peripherals non secure if present.
+                for periph in &spu.periphid {
+                    if periph.perm.read().present().is_is_present() {
+                        periph.perm.write(|w| w.secattr().non_secure())
+                    }
+                }
+
+                // Make all pins non secure
+                for pin in &spu.gpioport {
+                    pin.perm.write(|w| w.bits(0x00));
+                }
+
+                // Make all dppi non secure.
+                for dppi in &spu.dppi {
+                    dppi.perm.write(|w| w.bits(0));
+                }
+
+                // Configure the SAU to ALLNS and disabled, to allow the SPU to take over.
+                sau.ctrl.write(Ctrl(0x02));
+
+                bootload_ns(application_address as *const u32);
             }
         }
         None => panic!("Could not find a reset vector in the firmware"),
     }
+}
+
+unsafe fn bootload_ns(vector_table: *const u32) -> ! {
+    let msp = core::ptr::read_volatile(vector_table);
+    let rv = core::ptr::read_volatile(vector_table.offset(1));
+
+    // Write the NS VTOR.
+    let vtor_ns = 0xE002ED08 as *mut u32;
+    core::ptr::write_volatile(vtor_ns, vector_table as u32);
+
+    // Allow non secure access to all possible coprocessors
+    let scb_nsacr = 0xE000ED8C as *mut u32;
+    core::ptr::write_volatile(scb_nsacr, 0xCFFu32);
+
+    __bootload_asm(msp as *const u32, rv as *const u32);
+}
+
+unsafe fn __bootload_asm(msp: *const u32, rv: *const u32) -> ! {
+    // Adapted from the cortex-m boostrap implementation to boot a NS application
+    core::arch::asm!(
+        "mrs {tmp}, CONTROL_NS",
+        "bics {tmp}, {spsel}",
+        "msr CONTROL_NS, {tmp}",
+        "isb",
+        "msr MSP_NS, {msp}",
+        "movs {tmp}, #0",
+        "msr PSP_NS, {tmp}",
+        "movs {tmp}, #1",
+        "bics {rv}, {tmp}",
+        "dsb sy",
+        "isb sy",
+        "bxns {rv}",
+        // `out(reg) _` is not permitted in a `noreturn` asm! call,
+        // so instead use `in(reg) 0` and don't restore it afterwards.
+        tmp = in(reg) 0,
+        spsel = in(reg) 2,
+        msp = in(reg) msp,
+        rv = in(reg) rv,
+        options(noreturn, nomem, nostack),
+    )
 }
 
 #[cortex_m_rt::exception]
