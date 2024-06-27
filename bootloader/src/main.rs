@@ -8,7 +8,7 @@ use crate::flash::Flash;
 use core::mem::MaybeUninit;
 use cortex_m::peripheral::{sau::Ctrl, SAU};
 
-use embassy_nrf::pac::SPU;
+use embassy_nrf::pac::{NVMC, SPU, UICR};
 #[cfg(feature = "uart-log")]
 use embassy_nrf::{
     interrupt,
@@ -112,6 +112,39 @@ async fn run_main(
 
     #[cfg(not(feature = "uart-log"))]
     rtt_init_print!();
+
+    // Make sure to configure the UICR
+    {
+        let uicr = unsafe { core::mem::transmute::<_, UICR>(()) };
+
+        let nvm = unsafe { core::mem::transmute::<_, NVMC>(()) };
+
+        let reg = uicr.hfxosrc.read().bits();
+        if reg != 0x0e {
+            if reg != 0xFFFF_FFFF {
+                println!("WARN: Device erase may be required");
+            }
+
+            nvm.config.write(|w| w.wen().wen());
+            while nvm.ready.read().ready().is_busy() {}
+            uicr.hfxosrc.write(|w| unsafe { w.bits(0x0e) });
+            nvm.config.write(|w| w.wen().ren());
+            while nvm.ready.read().ready().is_busy() {}
+        }
+
+        let reg = uicr.hfxocnt.read().bits();
+        if reg != 0x20 {
+            if reg != 0xFFFF_FFFF {
+                println!("WARN: Device erase may be required");
+            }
+
+            nvm.config.write(|w| w.wen().wen());
+            while nvm.ready.read().ready().is_busy() {}
+            uicr.hfxocnt.write(|w| unsafe { w.bits(0x20) });
+            nvm.config.write(|w| w.wen().ren());
+            while nvm.ready.read().ready().is_busy() {}
+        }
+    }
 
     // Configure the uart
 
@@ -415,11 +448,21 @@ async fn jump_to_application(sau: SAU) -> ! {
                     });
                 }
 
+                // Use the NVIC ITNS register to target interrupts as non secure
+                let nvic_itns = 0xE000E380 as *mut u32;
+
                 // Make all peripherals non secure if present.
-                for periph in &spu.periphid {
+                for (i, periph) in spu.periphid.iter().enumerate() {
                     if periph.perm.read().present().is_is_present() {
-                        periph.perm.write(|w| w.secattr().non_secure())
+                        periph.perm.write(|w| w.secattr().non_secure());
+                        let mut val = core::ptr::read_volatile(nvic_itns.offset((i / 32) as isize));
+                        val |= 1 << (i % 32);
+                        core::ptr::write_volatile(nvic_itns.offset((i / 32) as isize), val);
                     }
+                }
+
+                for periph in &spu.extdomain {
+                    periph.perm.write(|w| w.secattr().non_secure());
                 }
 
                 // Make all pins non secure
