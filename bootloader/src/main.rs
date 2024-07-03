@@ -6,7 +6,7 @@
 
 use crate::flash::Flash;
 use core::mem::MaybeUninit;
-use cortex_m::peripheral::{sau::Ctrl, SAU};
+use cortex_m::peripheral::{sau::Ctrl, SAU, SCB};
 
 use embassy_nrf::pac::{NVMC, SPU, UICR};
 #[cfg(feature = "uart-log")]
@@ -212,11 +212,12 @@ async fn run_main(
     let mut state = BootloaderState::load(&flash);
 
     let sau = core_peripherals.SAU;
+    let scb = core_peripherals.SCB;
 
     // The state must be valid or we will just jump to the application
     if !state.is_valid() {
         println!("State is invalid, jumping to application");
-        jump_to_application(sau).await;
+        jump_to_application(scb, sau).await;
     }
 
     let goal = state.goal();
@@ -224,25 +225,25 @@ async fn run_main(
 
     match goal {
         BootloaderGoal::JumpToApplication => {
-            jump_to_application(sau).await;
+            jump_to_application(scb, sau).await;
         }
         BootloaderGoal::StartSwap => {
             state.prepare_swap(false, &mut flash); // TODO: think about reset here
             perform_swap(false, &mut state, &mut flash).await;
-            jump_to_application(sau).await;
+            jump_to_application(scb, sau).await;
         }
         BootloaderGoal::FinishSwap => {
             perform_swap(false, &mut state, &mut flash).await;
-            jump_to_application(sau).await;
+            jump_to_application(scb, sau).await;
         }
         BootloaderGoal::StartTestSwap => {
             state.prepare_swap(true, &mut flash);
             perform_swap(true, &mut state, &mut flash).await;
-            jump_to_application(sau).await;
+            jump_to_application(scb, sau).await;
         }
         BootloaderGoal::FinishTestSwap => {
             perform_swap(true, &mut state, &mut flash).await;
-            jump_to_application(sau).await;
+            jump_to_application(scb, sau).await;
         }
     }
 
@@ -375,7 +376,7 @@ async fn perform_swap(
 }
 
 /// Jump to the application if the application vector table can be found
-async fn jump_to_application(sau: SAU) -> ! {
+async fn jump_to_application(scb: SCB, sau: SAU) -> ! {
     // The application may not be stationed at the start of its slot.
     // We need to search for it first.
     // We will bootload to the first non-erased & non-padding (0xFFFF_FFFF, 0x0000_0000) word if the word after it could be a pointer to a reset vector inside the program_slot_a_range.
@@ -477,6 +478,12 @@ async fn jump_to_application(sau: SAU) -> ! {
 
                 // Configure the SAU to ALLNS and disabled, to allow the SPU to take over.
                 sau.ctrl.write(Ctrl(0x02));
+
+                let aircr = scb.aircr.read() & 0xFFFF;
+                // Set BFHFNMINS to 1, making fault and nmi exceptions non secure
+                scb.aircr.write(aircr | 0x05FA_0000 | (1 << 13));
+                // Target systick non secure
+                scb.icsr.modify(|w| w | (1 << 24));
 
                 bootload_ns(application_address as *const u32);
             }
