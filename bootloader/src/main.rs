@@ -9,7 +9,7 @@ use crate::flash::Flash;
 use core::{mem::MaybeUninit};
 use cortex_m::peripheral::{sau::Ctrl, SAU, SCB};
 
-use embassy_nrf::pac::{nvmc::vals::Wen, spu::vals::Present, NVMC, SPU, UICR};
+use embassy_nrf::pac::{spu::vals::Present, NVMC, SPU};
 #[cfg(feature = "uart-log")]
 use embassy_nrf::{
     interrupt,
@@ -72,17 +72,6 @@ macro_rules! uprintln {
             };
         }
     };
-}
-
-fn uicr_write(uicr_op: fn()) {
-    cortex_m::interrupt::free(|_cs| {
-        NVMC.config().write(|w| w.set_wen(Wen::WEN));
-        while !NVMC.ready().read().ready() {}
-        uicr_op();
-        cortex_m::asm::dsb();
-        NVMC.config().write(|w| w.set_wen(Wen::REN));
-        while !NVMC.ready().read().ready() {}
-    });
 }
 
 async fn run_main(
