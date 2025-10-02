@@ -123,67 +123,6 @@ async fn run_main(
     #[cfg(not(feature = "uart-log"))]
     rtt_init_print!();
 
-    // Make sure to configure the UICR
-    {
-        // Use TCXO as HFXO clock source
-        let reg = UICR.hfxosrc().read().0;
-        if reg != 0x0e {
-            if reg != 0xFFFF_FFFF {
-                println!("WARN: Device erase may be required");
-            }
-
-            uicr_write(|| {
-                UICR.hfxosrc().write(|w| w.0 = 0x0e);
-            });
-        }
-
-        // Set the HFXO startup counter
-        let reg = UICR.hfxocnt().read().0;
-        if reg != 0x20 {
-            if reg != 0xFFFF_FFFF {
-                println!("WARN: Device erase may be required");
-            }
-
-            uicr_write(|| {
-                UICR.hfxocnt().write(|w| w.0 = 0x20);
-            });
-        }
-
-        #[cfg(feature = "nrf9120")]
-        {
-            use embassy_nrf::pac::uicr::vals::ApprotectPall;
-            use embassy_nrf::pac::uicr::vals::SecureapprotectPall;
-            use embassy_nrf::pac::APPROTECT_S;
-            let reg = UICR.approtect().read().pall();
-            if reg != ApprotectPall::HW_UNPROTECTED {
-                if reg.0 != 0xFFFF_FFFF {
-                    println!("WARN: Device erase may be required");
-                }
-
-                uicr_write(|| {
-                    UICR.approtect().write(|w| w.set_pall(ApprotectPall::HW_UNPROTECTED) );
-                });
-            }
-
-            let reg = UICR.secureapprotect().read().pall();
-            if reg != SecureapprotectPall::HW_UNPROTECTED {
-                if reg.0 != 0xFFFF_FFFF {
-                    println!("WARN: Device erase may be required");
-                }
-
-                uicr_write(|| {
-                    UICR.secureapprotect().write(|w| w.set_pall(SecureapprotectPall::HW_UNPROTECTED));
-                });
-            }
-
-            // Make sure that AP protection is disabled
-            APPROTECT_S.approtect().disable();
-            APPROTECT_S.secureapprotect().disable();
-        }
-    }
-
-    // Configure the uart
-
     // Show a sign of life and print the version
     println!(
         "\n\n--== == == == == == == == == == == == == == ==--\nStarting bootloader version `{}` with git hash `{}`",
