@@ -2,13 +2,14 @@
 #![no_main]
 #![no_std]
 #![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 #![warn(missing_docs)]
 
 use crate::flash::Flash;
-use core::mem::MaybeUninit;
+use core::{mem::MaybeUninit};
 use cortex_m::peripheral::{sau::Ctrl, SAU, SCB};
 
-use embassy_nrf::pac::{NVMC, SPU, UICR};
+use embassy_nrf::pac::{nvmc::vals::Wen, spu::vals::Present, NVMC, SPU, UICR};
 #[cfg(feature = "uart-log")]
 use embassy_nrf::{
     interrupt,
@@ -73,14 +74,23 @@ macro_rules! uprintln {
     };
 }
 
+fn uicr_write(uicr_op: fn()) {
+    cortex_m::interrupt::free(|_cs| {
+        NVMC.config().write(|w| w.set_wen(Wen::WEN));
+        while !NVMC.ready().read().ready() {}
+        uicr_op();
+        cortex_m::asm::dsb();
+        NVMC.config().write(|w| w.set_wen(Wen::REN));
+        while !NVMC.ready().read().ready() {}
+    });
+}
+
 async fn run_main(
-    device_peripherals: embassy_nrf::Peripherals,
+    _device_peripherals: embassy_nrf::Peripherals,
     core_peripherals: cortex_m::Peripherals,
 ) {
     // Embassy doesn't give us a pac instance of the NVMC, so we need to make a reference ourselves
-    let mut flash = Flash {
-        registers: unsafe { &*embassy_nrf::pac::NVMC::PTR },
-    };
+    let mut flash = Flash { registers: &NVMC };
 
     #[cfg(feature = "uart-log")]
     {
@@ -115,34 +125,60 @@ async fn run_main(
 
     // Make sure to configure the UICR
     {
-        let uicr = unsafe { core::mem::transmute::<_, UICR>(()) };
-
-        let nvm = unsafe { core::mem::transmute::<_, NVMC>(()) };
-
-        let reg = uicr.hfxosrc.read().bits();
+        // Use TCXO as HFXO clock source
+        let reg = UICR.hfxosrc().read().0;
         if reg != 0x0e {
             if reg != 0xFFFF_FFFF {
                 println!("WARN: Device erase may be required");
             }
 
-            nvm.config.write(|w| w.wen().wen());
-            while nvm.ready.read().ready().is_busy() {}
-            uicr.hfxosrc.write(|w| unsafe { w.bits(0x0e) });
-            nvm.config.write(|w| w.wen().ren());
-            while nvm.ready.read().ready().is_busy() {}
+            uicr_write(|| {
+                UICR.hfxosrc().write(|w| w.0 = 0x0e);
+            });
         }
 
-        let reg = uicr.hfxocnt.read().bits();
+        // Set the HFXO startup counter
+        let reg = UICR.hfxocnt().read().0;
         if reg != 0x20 {
             if reg != 0xFFFF_FFFF {
                 println!("WARN: Device erase may be required");
             }
 
-            nvm.config.write(|w| w.wen().wen());
-            while nvm.ready.read().ready().is_busy() {}
-            uicr.hfxocnt.write(|w| unsafe { w.bits(0x20) });
-            nvm.config.write(|w| w.wen().ren());
-            while nvm.ready.read().ready().is_busy() {}
+            uicr_write(|| {
+                UICR.hfxocnt().write(|w| w.0 = 0x20);
+            });
+        }
+
+        #[cfg(feature = "nrf9120")]
+        {
+            use embassy_nrf::pac::uicr::vals::ApprotectPall;
+            use embassy_nrf::pac::uicr::vals::SecureapprotectPall;
+            use embassy_nrf::pac::APPROTECT_S;
+            let reg = UICR.approtect().read().pall();
+            if reg != ApprotectPall::HW_UNPROTECTED {
+                if reg.0 != 0xFFFF_FFFF {
+                    println!("WARN: Device erase may be required");
+                }
+
+                uicr_write(|| {
+                    UICR.approtect().write(|w| w.set_pall(ApprotectPall::HW_UNPROTECTED) );
+                });
+            }
+
+            let reg = UICR.secureapprotect().read().pall();
+            if reg != SecureapprotectPall::HW_UNPROTECTED {
+                if reg.0 != 0xFFFF_FFFF {
+                    println!("WARN: Device erase may be required");
+                }
+
+                uicr_write(|| {
+                    UICR.secureapprotect().write(|w| w.set_pall(SecureapprotectPall::HW_UNPROTECTED));
+                });
+            }
+
+            // Make sure that AP protection is disabled
+            APPROTECT_S.approtect().disable();
+            APPROTECT_S.secureapprotect().disable();
         }
     }
 
@@ -246,8 +282,6 @@ async fn run_main(
             jump_to_application(scb, sau).await;
         }
     }
-
-    loop {}
 }
 
 /// Actually performs the swapping procedure.
@@ -412,69 +446,59 @@ async fn jump_to_application(scb: SCB, sau: SAU) -> ! {
         Some(application_address) => {
             println!("Jumping to {:#08X}", application_address);
 
-            #[cfg(feautre = "uart-log")]
+            #[cfg(feature = "uart-log")]
             {
                 // We need to disable all used peripherals
                 drop(UART.take().unwrap());
             }
 
             unsafe {
-                let spu = core::mem::transmute::<_, SPU>(());
+                let spu = SPU;
 
                 // Leave the first 64KiB as secure and make everything else non secure
-                for region in spu.flashregion.iter().skip(2) {
-                    region.perm.write(|w| {
-                        w.secattr()
-                            .non_secure()
-                            .read()
-                            .enable()
-                            .write()
-                            .enable()
-                            .execute()
-                            .enable()
-                    });
+                for region in 2..32 {
+                    spu.flashregion(region).perm().write(|w| {
+                        w.set_execute(true);
+                        w.set_write(true);
+                        w.set_read(true);
+                        w.set_secattr(false);
+                        w.set_lock(false);
+                    })
                 }
 
                 // Leave the first 64KiB as secure and make everything else non secure
-                for region in spu.ramregion.iter().skip(8) {
-                    region.perm.write(|w| {
-                        w.secattr()
-                            .non_secure()
-                            .execute()
-                            .enable()
-                            .read()
-                            .enable()
-                            .write()
-                            .enable()
-                    });
+                for region in 8..32 {
+                    spu.ramregion(region).perm().write(|w|{
+                        w.set_execute(true);
+                        w.set_write(true);
+                        w.set_read(true);
+                        w.set_secattr(false);
+                        w.set_lock(false);
+                    })
                 }
 
                 // Use the NVIC ITNS register to target interrupts as non secure
                 let nvic_itns = 0xE000E380 as *mut u32;
 
                 // Make all peripherals non secure if present.
-                for (i, periph) in spu.periphid.iter().enumerate() {
-                    if periph.perm.read().present().is_is_present() {
-                        periph.perm.write(|w| w.secattr().non_secure());
+                for i in 0..67 {
+                    let periph = spu.periphid(i);
+                    if periph.perm().read().present() == Present::IS_PRESENT {
+                        periph.perm().write(|w| w.set_secattr(true));
                         let mut val = core::ptr::read_volatile(nvic_itns.offset((i / 32) as isize));
                         val |= 1 << (i % 32);
                         core::ptr::write_volatile(nvic_itns.offset((i / 32) as isize), val);
                     }
                 }
 
-                for periph in &spu.extdomain {
-                    periph.perm.write(|w| w.secattr().non_secure());
-                }
+                // Allow non secure access for EXT DOMAIN
+                spu.extdomain(0).perm().write(|w|w.set_lock(false));
 
-                // Make all pins non secure
-                for pin in &spu.gpioport {
-                    pin.perm.write(|w| w.bits(0x00));
-                }
+                // Mark all pins non secure.
+                spu.gpioport(0).perm().write(|w|w.0 = 0);
 
-                // Make all dppi non secure.
-                for dppi in &spu.dppi {
-                    dppi.perm.write(|w| w.bits(0));
-                }
+                // Make all DPPI channels non secure.
+                spu.dppi(0).perm().write(|w|w.0 = 0);
 
                 // Configure the SAU to ALLNS and disabled, to allow the SPU to take over.
                 sau.ctrl.write(Ctrl(0x02));
