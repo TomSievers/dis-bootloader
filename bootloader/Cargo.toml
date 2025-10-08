@@ -15,11 +15,12 @@ nrf9160-pac = "0.10.1"
 
 panic-persist = "0.3.0"
 
-embassy-executor = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy.git", features = [
+embassy-executor = { version = "0.9.1", features = [
     "nightly",
+    "arch-cortex-m",
+    "executor-thread"
 ] }
-embassy-nrf = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy.git", features = [
-    "nrf9160-s",
+embassy-nrf = { version = "0.8.0", features = [
     "unstable-pac",
 ] }
 
@@ -28,7 +29,7 @@ arrayvec = { version = "0.7.2", default-features = false }
 rtt-target = { version = "0.4.0" }
 
 [features]
-default = []
+default = ["nrf9120"]
 
 uart-log = []
 
@@ -37,3 +38,6 @@ mobility = ["uart-log"]
 feather = ["uart-log"]
 turing = ["uart-log"]
 actinius_icarus = ["uart-log"]
+
+nrf9160 = ["embassy-nrf/nrf9160-s"]
+nrf9120 = ["embassy-nrf/nrf9120-s"]

@@ -5,17 +5,17 @@
 use core::ops::Range;
 
 extern "C" {
-    static mut _bootloader_flash_start: u32;
-    static mut _bootloader_flash_end: u32;
-    static mut _bootloader_scratch_start: u32;
-    static mut _bootloader_scratch_end: u32;
-    static mut _bootloader_state_start: u32;
-    static mut _bootloader_state_end: u32;
+    static _bootloader_flash_start: u32;
+    static _bootloader_flash_end: u32;
+    static _bootloader_scratch_start: u32;
+    static _bootloader_scratch_end: u32;
+    static _bootloader_state_start: u32;
+    static _bootloader_state_end: u32;
 
-    static mut _program_slot_a_start: u32;
-    static mut _program_slot_a_end: u32;
-    static mut _program_slot_b_start: u32;
-    static mut _program_slot_b_end: u32;
+    static _program_slot_a_start: u32;
+    static _program_slot_a_end: u32;
+    static _program_slot_b_start: u32;
+    static _program_slot_b_end: u32;
 }
 
 /// The size of a page in bytes

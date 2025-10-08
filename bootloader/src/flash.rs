@@ -2,9 +2,11 @@
 
 use core::{mem::size_of, ops::Range};
 
+use embassy_nrf::pac::nvmc::vals::Wen;
+
 /// The bootloader's implementation of the flash operations
 pub struct Flash<'a> {
-    pub registers: &'a embassy_nrf::pac::nvmc::RegisterBlock,
+    pub registers: &'a embassy_nrf::pac::nvmc::Nvmc,
 }
 
 impl<'a> shared::Flash for Flash<'a> {
@@ -13,7 +15,7 @@ impl<'a> shared::Flash for Flash<'a> {
         assert_valid_page_address(page_address);
 
         // Enable the erase functionality of the flash
-        self.registers.config.modify(|_, w| w.wen().een());
+        self.registers.config().modify(|w| w.set_wen(Wen::EEN));
         // Start the erase process by writing a u32 word containing all 1's to the first word of the page
         // This is safe because the flash slice is page aligned, so a pointer to the first byte is valid as a pointer to a u32.
         unsafe {
@@ -21,9 +23,9 @@ impl<'a> shared::Flash for Flash<'a> {
             first_word.write_volatile(0xFFFFFFFF);
         }
         // Wait for the erase to be done
-        while self.registers.ready.read().ready().is_busy() {}
+        while !self.registers.ready().read().ready() {}
 
-        self.registers.config.modify(|_, w| w.wen().ren());
+        self.registers.config().modify(|w| w.set_wen(Wen::REN));
 
         // Synchronize the changes
         cortex_m::asm::dsb();
@@ -40,7 +42,7 @@ impl<'a> shared::Flash for Flash<'a> {
 
         // Now we need to write the buffer to flash
         // Set the flash to write mode
-        self.registers.config.modify(|_, w| w.wen().wen());
+        self.registers.config().modify(|w| w.set_wen(Wen::WEN));
 
         // Write the buffer words to the flash
         let word_size = core::mem::size_of::<u32>();
@@ -59,11 +61,11 @@ impl<'a> shared::Flash for Flash<'a> {
                 flash_word_ptr.write_volatile(*data_word);
             }
             // Wait for the write to be done
-            while self.registers.ready.read().ready().is_busy() {}
+            while !self.registers.ready().read().ready() {}
         }
 
         // Set the flash to default readonly mode
-        self.registers.config.modify(|_, w| w.wen().ren());
+        self.registers.config().modify(|w| w.set_wen(Wen::REN));
 
         // Synchronize the changes
         cortex_m::asm::dsb();
@@ -72,7 +74,7 @@ impl<'a> shared::Flash for Flash<'a> {
 
     fn read_u8(&self, address_range: Range<u32>) -> &[u8] {
         let entire_flash_slice =
-            unsafe { core::slice::from_raw_parts(0x0000_0000 as *const u8, 0x0010_0000) };
+            unsafe { core::slice::from_raw_parts(0x0000_0001 as *const u8, 0x0010_0000) };
 
         entire_flash_slice
             .get(address_range.start as usize..address_range.end as usize)
@@ -84,7 +86,7 @@ impl<'a> shared::Flash for Flash<'a> {
         assert!(address_range.end % 4 == 0);
 
         let entire_flash_slice = unsafe {
-            core::slice::from_raw_parts(0x0000_0000 as *const u32, 0x0010_0000 / size_of::<u32>())
+            core::slice::from_raw_parts(0x0000_0001 as *const u32, 0x0010_0000 / size_of::<u32>())
         };
 
         entire_flash_slice.get(address_range.start as usize / 4..address_range.end as usize / 4).unwrap()
