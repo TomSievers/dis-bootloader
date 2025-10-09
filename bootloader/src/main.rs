@@ -1,24 +1,20 @@
 #![doc = include_str!("../../README.md")]
 #![no_main]
 #![no_std]
-#![feature(type_alias_impl_trait)]
-#![feature(impl_trait_in_assoc_type)]
 #![warn(missing_docs)]
 
+use panic_persist as _;
+
 use crate::flash::Flash;
-use core::{mem::MaybeUninit};
+use core::mem::MaybeUninit;
 use cortex_m::peripheral::{sau::Ctrl, SAU, SCB};
 
-use embassy_nrf::pac::{spu::vals::Present, NVMC, SPU};
-#[cfg(feature = "uart-log")]
-use embassy_nrf::{
-    interrupt,
-    peripherals::UARTETWISPI0,
-    uarte::{self, Uarte},
-};
+use embassy_nrf::pac::{self, spu::vals::Present, NVMC, SPU};
+
 use panic_persist::get_panic_message_bytes;
-#[cfg(not(feature = "uart-log"))]
+
 use rtt_target::{rprintln, rtt_init_print};
+
 use shared::{
     flash_addresses::{
         bootloader_flash_page_range, bootloader_flash_range, bootloader_scratch_page_range,
@@ -31,93 +27,123 @@ use shared::{
 
 mod flash;
 
-#[cfg(feature = "uart-log")]
-type Uart = Uarte<'static, UARTETWISPI0>;
-
 /// A counter that keeps track of how many panics there have been. It keeps its value across resets.
 #[link_section = ".uninit"]
 static mut PANIC_COUNTS: MaybeUninit<u32> = MaybeUninit::uninit();
-
-#[embassy_executor::main]
-async fn main(_spawner: embassy_executor::Spawner) {
-    let device_peripherals = embassy_nrf::init(Default::default());
-    let core_peripherals = cortex_m::Peripherals::take().unwrap();
-    // Rust analyzer doesn't like the embassy macro, so as a hack, just immediately go to another function without it
-    run_main(device_peripherals, core_peripherals).await;
-}
 
 /// A print macro that takes either UART or RTT to print
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {
-        #[cfg(feature = "uart-log")]
-        uprintln!($($arg)*);
-        #[cfg(not(feature = "uart-log"))]
         rprintln!($($arg)*);
     };
 }
 
-/// A print macro that takes the uart and then the print expression like println!.
-#[macro_export]
-macro_rules! uprintln {
-    ($($arg:tt)*) => {
-        {
-            use core::fmt::Write as _;
-            let mut str = arrayvec::ArrayString::<1024>::new();
-            match writeln!(str, $($arg)*) {
-                Ok(_) => {
-                    UART.as_mut().unwrap().write(str.as_bytes()).await.unwrap();
-                },
-                Err(_) => UART.as_mut().unwrap().write("Error: failed to print string, too long".as_bytes()).await.unwrap(),
-            };
-        }
-    };
+mod consts {
+    pub const UICR_APPROTECT: *mut u32 = 0x00FF8000 as *mut u32;
+    pub const UICR_HFXOSRC: *mut u32 = 0x00FF801C as *mut u32;
+    pub const UICR_HFXOCNT: *mut u32 = 0x00FF8020 as *mut u32;
+    pub const UICR_SECUREAPPROTECT: *mut u32 = 0x00FF802C as *mut u32;
+    pub const APPROTECT_ENABLED: u32 = 0x0000_0000;
+    #[cfg(feature = "nrf9120")]
+    pub const APPROTECT_DISABLED: u32 = 0x50FA50FA;
 }
 
-async fn run_main(
-    _device_peripherals: embassy_nrf::Peripherals,
-    core_peripherals: cortex_m::Peripherals,
-) {
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum WriteResult {
+    /// Word was written successfully, needs reset.
+    Written,
+    /// Word was already set to the value we wanted to write, nothing was done.
+    Noop,
+    /// Word is already set to something else, we couldn't write the desired value.
+    Failed,
+}
+
+unsafe fn uicr_write(address: *mut u32, value: u32) -> WriteResult {
+    uicr_write_masked(address, value, 0xFFFF_FFFF)
+}
+
+unsafe fn uicr_write_masked(address: *mut u32, value: u32, mask: u32) -> WriteResult {
+    let curr_val = address.read_volatile();
+    if curr_val & mask == value & mask {
+        return WriteResult::Noop;
+    }
+
+    // We can only change `1` bits to `0` bits.
+    if curr_val & value & mask != value & mask {
+        return WriteResult::Failed;
+    }
+
+    // Nrf9151 errata 7, need to disable interrups + use DSB https://docs.nordicsemi.com/bundle/errata_nRF9151_Rev2/page/ERR/nRF9151/Rev2/latest/anomaly_151_7.html
+    cortex_m::interrupt::free(|_cs| {
+        let nvmc = pac::NVMC;
+
+        nvmc.config()
+            .write(|w| w.set_wen(pac::nvmc::vals::Wen::WEN));
+        while !nvmc.ready().read().ready() {}
+        address.write_volatile(value | !mask);
+        cortex_m::asm::dsb();
+        while !nvmc.ready().read().ready() {}
+        nvmc.config().write(|_| {});
+        while !nvmc.ready().read().ready() {}
+    });
+
+    WriteResult::Written
+}
+
+#[cortex_m_rt::entry]
+unsafe fn run_main() -> ! {
+    let core_peripherals = cortex_m::Peripherals::take().unwrap();
+
+    let mut needs_reset = false;
+
+    let uicr = pac::UICR_S;
+    let hfxocnt = uicr.hfxocnt().read().hfxocnt().to_bits();
+    let hfxosrc = uicr.hfxosrc().read().hfxosrc().to_bits();
+
+    if hfxosrc == 1 {
+        unsafe {
+            let _ = uicr_write(consts::UICR_HFXOSRC, 0);
+        }
+        needs_reset = true;
+    }
+
+    if hfxocnt == 255 {
+        unsafe {
+            let _ = uicr_write(consts::UICR_HFXOCNT, 32);
+        }
+        needs_reset = true;
+    }
+
+    #[cfg(feature = "nrf9120")]
+    unsafe {
+        use embassy_nrf::pac;
+
+        let p = pac::APPROTECT_S;
+
+        let res = uicr_write(consts::UICR_APPROTECT, consts::APPROTECT_DISABLED);
+        needs_reset |= res == WriteResult::Written;
+        p.approtect().disable().write(|w| {
+            w.set_disable(pac::approtect::vals::ApprotectDisableDisable::SW_UNPROTECTED)
+        });
+
+        let res = uicr_write(consts::UICR_SECUREAPPROTECT, consts::APPROTECT_DISABLED);
+        needs_reset |= res == WriteResult::Written;
+        p.secureapprotect().disable().write(|w| {
+            w.set_disable(pac::approtect::vals::SecureapprotectDisableDisable::SW_UNPROTECTED)
+        });
+    }
+
+    if needs_reset {
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+
     // Embassy doesn't give us a pac instance of the NVMC, so we need to make a reference ourselves
     let mut flash = Flash { registers: &NVMC };
 
-    #[cfg(feature = "uart-log")]
-    {
-        let mut config = uarte::Config::default();
-        config.parity = uarte::Parity::EXCLUDED;
-        config.baudrate = uarte::Baudrate::BAUD115200;
-
-        let irq = interrupt::take!(UARTE0_SPIM0_SPIS0_TWIM0_TWIS0);
-
-        #[cfg(feature = "feather")]
-        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_05, device_peripherals.P0_06);
-        #[cfg(feature = "logistics")]
-        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_28, device_peripherals.P0_29);
-        #[cfg(feature = "mobility")]
-        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_28, device_peripherals.P0_29);
-        #[cfg(feature = "turing")]
-        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_30, device_peripherals.P0_19);
-        #[cfg(feature = "actinius_icarus")]
-        let (uart_rx_pin, uart_tx_pin) = (device_peripherals.P0_06, device_peripherals.P0_09);
-
-        UART = Some(uarte::Uarte::new(
-            device_peripherals.UARTETWISPI0,
-            irq,
-            uart_rx_pin,
-            uart_tx_pin,
-            config,
-        ));
-    }
-
-    #[cfg(not(feature = "uart-log"))]
     rtt_init_print!();
 
-    // Show a sign of life and print the version
-    println!(
-        "\n\n--== == == == == == == == == == == == == == ==--\nStarting bootloader version `{}` with git hash `{}`",
-        env!("CP_CARGO"),
-        env!("CP_GIT")
-    );
+    println!("Dis-Bootloader starting up...");
 
     // Get how many panics we've gotten
     let panics = unsafe { PANIC_COUNTS.assume_init_mut() };
@@ -134,12 +160,21 @@ async fn run_main(
         *panics += 1;
     }
 
-    println!("There have been {} panics so far.", panics);
+    println!("Panic count {}", panics);
 
     // If there are too many panics, let's just sleep and potentially save the flash memory
     if *panics > 10 {
-        println!( "There have been too many panics. Bootloader will try to save the flash by going to sleep. The device can be woken up by sending a single byte over serial. The panics counter will then be reset to 0 so you can see all the output again");
+        println!("Too many panics, going to sleep and resetting");
         *panics = 0;
+
+        // When on the nrf9120 we need to make sure that the constant latency mode enabled when entering system on idle.
+        // See: https://docs.nordicsemi.com/bundle/errata_nRF9151_Rev1/page/ERR/nRF9151/Rev1/latest/anomaly_151_36.html#anomaly_151_36
+        #[cfg(feature = "nrf9120")]
+        {
+            pac::POWER.tasks_constlat().write(|w| *w = 1);
+            cortex_m::asm::dsb();
+        }
+
         cortex_m::asm::wfi();
         cortex_m::peripheral::SCB::sys_reset();
     }
@@ -181,7 +216,7 @@ async fn run_main(
     // The state must be valid or we will just jump to the application
     if !state.is_valid() {
         println!("State is invalid, jumping to application");
-        jump_to_application(scb, sau).await;
+        jump_to_application(scb, sau);
     }
 
     let goal = state.goal();
@@ -189,25 +224,25 @@ async fn run_main(
 
     match goal {
         BootloaderGoal::JumpToApplication => {
-            jump_to_application(scb, sau).await;
+            jump_to_application(scb, sau);
         }
         BootloaderGoal::StartSwap => {
             state.prepare_swap(false, &mut flash); // TODO: think about reset here
-            perform_swap(false, &mut state, &mut flash).await;
-            jump_to_application(scb, sau).await;
+            perform_swap(false, &mut state, &mut flash);
+            jump_to_application(scb, sau);
         }
         BootloaderGoal::FinishSwap => {
-            perform_swap(false, &mut state, &mut flash).await;
-            jump_to_application(scb, sau).await;
+            perform_swap(false, &mut state, &mut flash);
+            jump_to_application(scb, sau);
         }
         BootloaderGoal::StartTestSwap => {
             state.prepare_swap(true, &mut flash);
-            perform_swap(true, &mut state, &mut flash).await;
-            jump_to_application(scb, sau).await;
+            perform_swap(true, &mut state, &mut flash);
+            jump_to_application(scb, sau);
         }
         BootloaderGoal::FinishTestSwap => {
-            perform_swap(true, &mut state, &mut flash).await;
-            jump_to_application(scb, sau).await;
+            perform_swap(true, &mut state, &mut flash);
+            jump_to_application(scb, sau);
         }
     }
 }
@@ -216,11 +251,7 @@ async fn run_main(
 ///
 /// If the state has been prepared for a swap, all pages will be swapped.
 /// If not, then it will resume a previous swap.
-async fn perform_swap(
-    test_swap: bool,
-    state: &mut BootloaderState,
-    flash: &mut impl shared::Flash,
-) {
+fn perform_swap(test_swap: bool, state: &mut BootloaderState, flash: &mut impl shared::Flash) {
     // Gather info about our memory layout
     let total_program_pages = program_slot_a_page_range().len() as u32;
     let total_scratch_pages = bootloader_scratch_page_range().len() as u32;
@@ -338,7 +369,7 @@ async fn perform_swap(
 }
 
 /// Jump to the application if the application vector table can be found
-async fn jump_to_application(scb: SCB, sau: SAU) -> ! {
+fn jump_to_application(scb: SCB, sau: SAU) -> ! {
     // The application may not be stationed at the start of its slot.
     // We need to search for it first.
     // We will bootload to the first non-erased & non-padding (0xFFFF_FFFF, 0x0000_0000) word if the word after it could be a pointer to a reset vector inside the program_slot_a_range.
@@ -374,12 +405,6 @@ async fn jump_to_application(scb: SCB, sau: SAU) -> ! {
         Some(application_address) => {
             println!("Jumping to {:#08X}", application_address);
 
-            #[cfg(feature = "uart-log")]
-            {
-                // We need to disable all used peripherals
-                drop(UART.take().unwrap());
-            }
-
             unsafe {
                 let spu = SPU;
 
@@ -396,7 +421,7 @@ async fn jump_to_application(scb: SCB, sau: SAU) -> ! {
 
                 // Leave the first 64KiB as secure and make everything else non secure
                 for region in 8..32 {
-                    spu.ramregion(region).perm().write(|w|{
+                    spu.ramregion(region).perm().write(|w| {
                         w.set_execute(true);
                         w.set_write(true);
                         w.set_read(true);
@@ -420,13 +445,13 @@ async fn jump_to_application(scb: SCB, sau: SAU) -> ! {
                 }
 
                 // Allow non secure access for EXT DOMAIN
-                spu.extdomain(0).perm().write(|w|w.set_lock(false));
+                spu.extdomain(0).perm().write(|w| w.set_lock(false));
 
                 // Mark all pins non secure.
-                spu.gpioport(0).perm().write(|w|w.0 = 0);
+                spu.gpioport(0).perm().write(|w| w.0 = 0);
 
                 // Make all DPPI channels non secure.
-                spu.dppi(0).perm().write(|w|w.0 = 0);
+                spu.dppi(0).perm().write(|w| w.0 = 0);
 
                 // Configure the SAU to ALLNS and disabled, to allow the SPU to take over.
                 sau.ctrl.write(Ctrl(0x02));

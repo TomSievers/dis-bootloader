@@ -1,8 +1,6 @@
 [workspace]
-members = [
-    "bootloader",
-    "shared"
-]
+members = ["bootloader", "shared"]
+resolver = "2"
 
 [profile.release]
 debug = true

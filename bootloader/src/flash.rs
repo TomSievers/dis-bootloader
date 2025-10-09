@@ -74,7 +74,7 @@ impl<'a> shared::Flash for Flash<'a> {
 
     fn read_u8(&self, address_range: Range<u32>) -> &[u8] {
         let entire_flash_slice =
-            unsafe { core::slice::from_raw_parts(0x0000_0001 as *const u8, 0x0010_0000) };
+            unsafe { &*core::ptr::slice_from_raw_parts(0x0000_0000 as *const u8, 0x0010_0000) };
 
         entire_flash_slice
             .get(address_range.start as usize..address_range.end as usize)
@@ -86,10 +86,15 @@ impl<'a> shared::Flash for Flash<'a> {
         assert!(address_range.end % 4 == 0);
 
         let entire_flash_slice = unsafe {
-            core::slice::from_raw_parts(0x0000_0001 as *const u32, 0x0010_0000 / size_of::<u32>())
+            &*core::ptr::slice_from_raw_parts(
+                0x0000_0000 as *const u32,
+                0x0010_0000 / size_of::<u32>(),
+            )
         };
 
-        entire_flash_slice.get(address_range.start as usize / 4..address_range.end as usize / 4).unwrap()
+        entire_flash_slice
+            .get(address_range.start as usize / 4..address_range.end as usize / 4)
+            .unwrap()
     }
 }
 
