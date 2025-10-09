@@ -437,7 +437,7 @@ fn jump_to_application(scb: SCB, sau: SAU) -> ! {
                 for i in 0..67 {
                     let periph = spu.periphid(i);
                     if periph.perm().read().present() == Present::IS_PRESENT {
-                        periph.perm().write(|w| w.set_secattr(true));
+                        periph.perm().write(|w| w.set_secattr(false));
                         let mut val = core::ptr::read_volatile(nvic_itns.offset((i / 32) as isize));
                         val |= 1 << (i % 32);
                         core::ptr::write_volatile(nvic_itns.offset((i / 32) as isize), val);

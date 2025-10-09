@@ -20,7 +20,7 @@ arrayvec = { version = "0.7.2", default-features = false }
 rtt-target = { version = "0.6.1" }
 
 [features]
-default = ["nrf9120"]
+default = []
 
 nrf9160 = ["embassy-nrf/nrf9160-s"]
 nrf9120 = ["embassy-nrf/nrf9120-s"]
