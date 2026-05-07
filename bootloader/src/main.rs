@@ -91,8 +91,25 @@ unsafe fn uicr_write_masked(address: *mut u32, value: u32, mask: u32) -> WriteRe
     WriteResult::Written
 }
 
+fn wait_for_flashing() -> ! {
+    println!("Waiting for flashing...");
+
+    // When on the nrf9120 we need to make sure that the constant latency mode enabled when entering system on idle.
+    // See: https://docs.nordicsemi.com/bundle/errata_nRF9151_Rev1/page/ERR/nRF9151/Rev1/latest/anomaly_151_36.html#anomaly_151_36
+    #[cfg(feature = "nrf9120")]
+    {
+        pac::POWER.tasks_constlat().write(|w| *w = 1);
+        cortex_m::asm::dsb();
+    }
+
+    cortex_m::asm::wfi();
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
 #[cortex_m_rt::entry]
 unsafe fn run_main() -> ! {
+    rtt_init_print!();
+
     let core_peripherals = cortex_m::Peripherals::take().unwrap();
 
     let mut needs_reset = false;
@@ -141,8 +158,6 @@ unsafe fn run_main() -> ! {
     // Embassy doesn't give us a pac instance of the NVMC, so we need to make a reference ourselves
     let mut flash = Flash { registers: &NVMC };
 
-    rtt_init_print!();
-
     println!("Dis-Bootloader starting up...");
 
     // Get how many panics we've gotten
@@ -167,16 +182,7 @@ unsafe fn run_main() -> ! {
         println!("Too many panics, going to sleep and resetting");
         *panics = 0;
 
-        // When on the nrf9120 we need to make sure that the constant latency mode enabled when entering system on idle.
-        // See: https://docs.nordicsemi.com/bundle/errata_nRF9151_Rev1/page/ERR/nRF9151/Rev1/latest/anomaly_151_36.html#anomaly_151_36
-        #[cfg(feature = "nrf9120")]
-        {
-            pac::POWER.tasks_constlat().write(|w| *w = 1);
-            cortex_m::asm::dsb();
-        }
-
-        cortex_m::asm::wfi();
-        cortex_m::peripheral::SCB::sys_reset();
+        wait_for_flashing();
     }
 
     // Print the memory regions we're using, just for convenience
@@ -378,6 +384,8 @@ fn jump_to_application(scb: SCB, sau: SAU) -> ! {
 
     let mut found_init_stack_pointer = false;
 
+    println!("Searching for application vector table in program slot A...");
+
     for possible_address in program_slot_a_range().step_by(4) {
         // We can read this address safely because it will always be in flash
         let address_value = unsafe { (possible_address as *const u32).read_volatile() };
@@ -400,6 +408,11 @@ fn jump_to_application(scb: SCB, sau: SAU) -> ! {
             }
         }
     }
+
+    println!(
+        "Found application vector table at: {:#010X?}",
+        application_address
+    );
 
     match application_address {
         Some(application_address) => {
@@ -465,7 +478,7 @@ fn jump_to_application(scb: SCB, sau: SAU) -> ! {
                 bootload_ns(application_address as *const u32);
             }
         }
-        None => panic!("Could not find a reset vector in the firmware"),
+        None => wait_for_flashing(),
     }
 }
 

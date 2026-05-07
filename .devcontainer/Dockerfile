@@ -1,4 +1,4 @@
-FROM docker.io/rust:1.90-trixie
+FROM docker.io/rust:1.94-trixie
 
 USER root
 
